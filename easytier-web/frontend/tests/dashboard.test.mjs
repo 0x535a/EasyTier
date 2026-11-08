@@ -800,3 +800,22 @@ test('external Console keeps the device dashboard without central requests or na
     assert.equal(await page.locator('a[href*="/networks"]').count(), 0);
     assert.equal(await page.locator('.p-message-warn').count(), 0);
 });
+
+
+test('imported member node detail and export use its existing runtime instance', async t => {
+    const { page, state } = await open(t, `/h/networks/${id(100)}`, {}, state => {
+        state.networks[0].network_id = id(100);
+        state.members[0].instance_id = id(200);
+    });
+    await page.getByRole('button', { name: 'Node Detail' }).click();
+    const drawer = page.locator('.console-node-drawer');
+    await drawer.getByText('No other nodes yet').waitFor();
+    await drawer.getByRole('tab', { name: 'Settings & actions' }).click();
+    await drawer.getByRole('button', { name: 'Export Config' }).click();
+    await page.getByText('[instance]', { exact: false }).waitFor();
+    for (const method of ['list_route', 'list_peer', 'get_acl_stats', 'show_node_info']) {
+        const request = state.writes.find(r => r.payload?.method_name === method);
+        assert.ok(request, method);
+        assert.deepEqual(request.payload.payload.instance.id, uuid(200), method);
+    }
+});

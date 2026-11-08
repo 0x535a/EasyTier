@@ -10,7 +10,9 @@ use easytier::proto::{
     rpc_types::controller::BaseController,
     web::HeartbeatRequest,
 };
-use easytier_core::management::remote_client::{ListNetworkProps, Storage as _};
+use easytier_core::management::remote_client::{
+    ListNetworkProps, PersistentConfig as _, Storage as _,
+};
 use tokio::sync::{RwLock, broadcast};
 
 use super::{
@@ -96,7 +98,7 @@ pub(super) async fn reconcile_network_configs_on_heartbeat(
                 RoundStatus::Stop => return,
             };
         cache.reset_if_runtime_config_cache_epoch_changed(round.runtime_config_cache_epoch);
-        let running_metas =
+        let mut running_metas =
             match sync_running_sources_for_round(&mut clients.rpc, &storage, &mut round).await {
                 RoundStatus::Ready(running_metas) => running_metas,
                 RoundStatus::Skip => continue,
@@ -112,6 +114,19 @@ pub(super) async fn reconcile_network_configs_on_heartbeat(
             RoundStatus::Stop => return,
         }
         let mut mutation_fence = RuntimeMutationFence::default();
+        match adopt_imported_instances(
+            &context,
+            &storage,
+            &mut clients.rpc,
+            running_metas.as_mut(),
+            &mut mutation_fence,
+        )
+        .await
+        {
+            RoundStatus::Ready(()) => {}
+            RoundStatus::Skip => continue,
+            RoundStatus::Stop => return,
+        }
 
         let mut outcome = match &round.scope {
             ReconcileScope::Full => {
@@ -709,6 +724,79 @@ async fn sync_running_sources_for_round(
             RoundStatus::Ready(None)
         }
     }
+}
+
+// A legacy instance must become Web-owned on the client as well as in the DB.
+// Otherwise removing a member could leave its old user-owned runtime running.
+async fn adopt_imported_instances(
+    context: &ReconcileRoundContext<'_>,
+    storage: &StorageInner,
+    rpc: &mut SessionRpcClient,
+    metas: Option<&mut Vec<NetworkMeta>>,
+    mutation_fence: &mut RuntimeMutationFence,
+) -> RoundStatus<()> {
+    use easytier::proto::api::manage::ConfigSource;
+    let Some(metas) = metas else {
+        return RoundStatus::Ready(());
+    };
+    if !metas
+        .iter()
+        .any(|meta| meta.source == ConfigSource::User as i32)
+    {
+        return RoundStatus::Ready(());
+    }
+    let round = context.round;
+    let adopted: Vec<String> = match sqlx::query_scalar(
+        "SELECT runtime_instance_id FROM network_members WHERE user_id = ? AND device_id = ? AND runtime_instance_id IS NOT NULL",
+    ).bind(round.user_id).bind(round.machine_id.to_string()).fetch_all(&storage.db.inner()).await {
+        Ok(ids) => ids,
+        Err(error) => { tracing::warn!(%error, "failed to read imported instance ownership"); return RoundStatus::Skip; }
+    };
+    for meta in metas {
+        if meta.source != ConfigSource::User as i32 {
+            continue;
+        }
+        let Some(id) = meta.inst_id.map(uuid::Uuid::from) else {
+            continue;
+        };
+        if !adopted.contains(&id.to_string()) {
+            continue;
+        }
+        let Some(local) = round
+            .local_configs
+            .iter()
+            .find(|config| config.network_instance_id == id.to_string() && config.source == "web")
+        else {
+            continue;
+        };
+        let config = match local.get_network_config() {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(?error, "invalid imported runtime configuration");
+                return RoundStatus::Skip;
+            }
+        };
+        if !begin_managed_runtime_mutation(context.session_data, round, mutation_fence).await {
+            return RoundStatus::Skip;
+        }
+        if let Err(error) = rpc
+            .run_network_instance(
+                BaseController::default(),
+                RunNetworkInstanceRequest {
+                    inst_id: Some(id.into()),
+                    config: Some(config),
+                    overwrite: true,
+                    source: ConfigSource::Web as i32,
+                },
+            )
+            .await
+        {
+            tracing::warn!(%error, %id, "failed to adopt imported runtime ownership");
+            return RoundStatus::Skip;
+        }
+        meta.source = ConfigSource::Web as i32;
+    }
+    RoundStatus::Ready(())
 }
 
 async fn cleanup_stale_web_source_instances(

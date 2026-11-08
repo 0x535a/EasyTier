@@ -168,6 +168,7 @@ pub struct NetworkDetail {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MemberInfo {
     pub member_id: String,
+    pub instance_id: String,
     pub device_id: String,
     pub hostname: Option<String>,
     pub hostname_override: Option<String>,
@@ -449,6 +450,18 @@ impl CentralNetworkService {
         if let Some(network_name) = request.settings.network_name {
             intent.network_name = network_name;
         }
+        if intent.mode != mode {
+            for member in &mut intent.members {
+                if member.runtime_instance_id.is_some() {
+                    if let Some(config) = &mut member.config_override {
+                        config.networking_method = None;
+                        config.public_server_url = None;
+                        config.peer_urls.clear();
+                        config.peers.clear();
+                    }
+                }
+            }
+        }
         intent.mode = mode;
         if intent.virtual_cidr != request.settings.virtual_cidr {
             for member in &mut intent.members {
@@ -628,6 +641,7 @@ impl CentralNetworkService {
                 });
             }
             intent.members.push(NetworkMemberIntent {
+                runtime_instance_id: None,
                 id: member_id,
                 device_id: device_id.to_string(),
                 hostname: None,
@@ -926,7 +940,7 @@ impl CentralNetworkService {
         device: Option<&crate::db::entity::devices::Model>,
     ) -> Result<MemberInfo, CentralNetworkServiceError> {
         let user_id = intent.user_id;
-        let network_id = intent.id;
+        let instance_id = member.instance_id(intent.id);
         let device_id = Uuid::parse_str(&member.device_id)
             .map_err(|_| CentralNetworkServiceError::Database("invalid stored device id".into()))?;
         let online = self
@@ -939,12 +953,12 @@ impl CentralNetworkService {
         if online {
             match self
                 .client_manager
-                .handle_collect_network_info((user_id, device_id), Some(vec![network_id]))
+                .handle_collect_network_info((user_id, device_id), Some(vec![instance_id]))
                 .await
             {
                 Ok(response) => {
                     if let Some((is_running, virtual_ipv4, runtime_error)) =
-                        member_runtime_fields(&response, network_id)
+                        member_runtime_fields(&response, instance_id)
                     {
                         running = Some(is_running);
                         runtime_virtual_ipv4 = virtual_ipv4;
@@ -964,6 +978,7 @@ impl CentralNetworkService {
         });
         Ok(MemberInfo {
             member_id: member.id.to_string(),
+            instance_id: instance_id.to_string(),
             device_id: member.device_id.clone(),
             hostname: member
                 .hostname
@@ -1099,7 +1114,11 @@ impl CentralNetworkService {
                     .map_err(|error| CentralNetworkServiceError::Database(error.to_string()))?;
                 configs_by_device.entry(device_id).or_default().push(
                     crate::webhook::ManagedNetworkConfig {
-                        instance_id: network_id.to_string(),
+                        instance_id: member
+                            .network_config
+                            .instance_id
+                            .clone()
+                            .expect("compiled instance id"),
                         network_config: serde_json::to_value(member.network_config).map_err(
                             |error| CentralNetworkServiceError::Database(error.to_string()),
                         )?,

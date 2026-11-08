@@ -117,8 +117,8 @@ pub fn compile(intent: &CentralNetworkIntent) -> Result<CompiledNetwork, Compile
                 .or(Some(24));
 
             let base_config = NetworkConfig {
-                instance_id: Some(intent.id.to_string()),
-                dhcp: Some(address.is_none()),
+                instance_id: Some(member.instance_id(intent.id).to_string()),
+                dhcp: Some(address.is_none() && !legacy_without_virtual_ip(member)),
                 virtual_ipv4: address.map(|address| address.to_string()),
                 network_length,
                 hostname: member.hostname.clone(),
@@ -147,14 +147,17 @@ pub fn compile(intent: &CentralNetworkIntent) -> Result<CompiledNetwork, Compile
                 acl: acl.get(&member.id).cloned().flatten(),
                 ..Default::default()
             };
-            let network_config =
-                apply_member_override(base_config, member.config_override.as_ref());
-            validate_member_config(&network_config).map_err(|error| {
-                CompileError::InvalidMemberConfig {
+            let network_config = apply_member_override(
+                base_config,
+                member.config_override.as_ref(),
+                member.runtime_instance_id.is_some(),
+            );
+            validate_member_config(&network_config, member.runtime_instance_id.is_some()).map_err(
+                |error| CompileError::InvalidMemberConfig {
                     member_id: member.id,
                     reason: format!("{error:#}"),
-                }
-            })?;
+                },
+            )?;
 
             Ok(CompiledMember {
                 member_id: member.id,
@@ -169,7 +172,30 @@ pub fn compile(intent: &CentralNetworkIntent) -> Result<CompiledNetwork, Compile
     })
 }
 
-fn validate_member_config(config: &NetworkConfig) -> anyhow::Result<()> {
+#[allow(deprecated)]
+fn validate_member_config(config: &NetworkConfig, imported: bool) -> anyhow::Result<()> {
+    // Imported configs are sent back to their existing clients. Older clients
+    // still support the legacy portal fields, which the current TOML generator
+    // deliberately rejects. Validate those fields separately and retain them
+    // in the published config.
+    let mut validation_config = config.clone();
+    if imported && config.enable_vpn_portal == Some(true) {
+        let address = config
+            .vpn_portal_client_network_addr
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("missing legacy VPN portal client network"))?;
+        address.parse::<Ipv4Addr>()?;
+        anyhow::ensure!(
+            matches!(config.vpn_portal_client_network_len, Some(0..=32)),
+            "invalid legacy VPN portal network length"
+        );
+        anyhow::ensure!(
+            matches!(config.vpn_portal_listen_port, Some(1..=65535)),
+            "invalid legacy VPN portal port"
+        );
+        validation_config.enable_vpn_portal = Some(false);
+    }
+    let config = &validation_config;
     let normalized = CoreInstanceConfig::from_toml(&config.gen_config()?)?;
     if let Some(portal) = &normalized.vpn_portal {
         validate_clients(
@@ -183,9 +209,18 @@ fn validate_member_config(config: &NetworkConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn legacy_without_virtual_ip(member: &NetworkMemberIntent) -> bool {
+    member.runtime_instance_id.is_some()
+        && member.virtual_ipv4.is_none()
+        && member.config_override.as_ref().is_some_and(|config| {
+            config.no_tun == Some(true) && config.virtual_ipv4.as_deref().is_none_or(str::is_empty)
+        })
+}
+
 fn apply_member_override(
     base: NetworkConfig,
     config_override: Option<&NetworkConfig>,
+    imported: bool,
 ) -> NetworkConfig {
     let Some(config_override) = config_override else {
         return base;
@@ -201,10 +236,14 @@ fn apply_member_override(
     merged.hostname = base.hostname;
     merged.network_name = base.network_name;
     merged.network_secret = base.network_secret;
-    merged.networking_method = base.networking_method;
-    merged.public_server_url = base.public_server_url;
-    merged.peer_urls = base.peer_urls;
-    merged.peers = base.peers;
+    // Imported instances may use different bootstrap peers (including a relay
+    // with no outbound peers). Keep these until the network topology is edited.
+    if !imported || merged.networking_method.is_none() {
+        merged.networking_method = base.networking_method;
+        merged.public_server_url = base.public_server_url;
+        merged.peer_urls = base.peer_urls;
+        merged.peers = base.peers;
+    }
     merged.secure_mode = base.secure_mode;
     merged.managed_credentials = base.managed_credentials;
     merged.acl = base.acl;
@@ -425,6 +464,10 @@ fn assign_addresses(
     let mut result = HashMap::new();
 
     for member in members {
+        if legacy_without_virtual_ip(member) {
+            result.insert(member.id, None);
+            continue;
+        }
         let Some(value) = member.virtual_ipv4.as_deref() else {
             continue;
         };
@@ -807,6 +850,7 @@ mod tests {
 
     fn member(id: u128, device_id: &str, credential_id: Option<&str>) -> NetworkMemberIntent {
         NetworkMemberIntent {
+            runtime_instance_id: None,
             id: Uuid::from_u128(id),
             device_id: device_id.to_owned(),
             hostname: Some(device_id.to_owned()),
@@ -881,6 +925,69 @@ mod tests {
                 }],
             }),
         }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn imported_legacy_portal_is_preserved_and_validated() {
+        let mut config = NetworkConfig {
+            networking_method: Some(NetworkingMethod::Standalone as i32),
+            enable_vpn_portal: Some(true),
+            vpn_portal_client_network_addr: Some("10.99.0.0".to_owned()),
+            vpn_portal_client_network_len: Some(24),
+            vpn_portal_listen_port: Some(22020),
+            ..Default::default()
+        };
+        validate_member_config(&config, true).unwrap();
+        assert_eq!(config.enable_vpn_portal, Some(true));
+        assert!(validate_member_config(&config, false).is_err());
+        config.vpn_portal_listen_port = Some(65536);
+        assert!(validate_member_config(&config, true).is_err());
+    }
+
+    #[test]
+    fn imported_instances_keep_identity_bootstrap_and_relay_role() {
+        let mut network = intent();
+        network.secure_mode = false;
+        network.acl_policy = None;
+        network.credentials.clear();
+        let runtime_id = Uuid::new_v4();
+        let mut relay = member(1, "relay", None);
+        relay.runtime_instance_id = Some(runtime_id);
+        relay.config_override = Some(NetworkConfig {
+            no_tun: Some(true),
+            dhcp: Some(false),
+            networking_method: Some(NetworkingMethod::Standalone as i32),
+            listener_urls: vec!["tcp://0.0.0.0:11010".to_owned()],
+            ..Default::default()
+        });
+        network.members = vec![relay];
+        let compiled = compile(&network).unwrap();
+        let config = &compiled.members[0].network_config;
+        assert_eq!(config.instance_id, Some(runtime_id.to_string()));
+        assert_eq!(config.virtual_ipv4, None);
+        assert_eq!(config.dhcp, Some(false));
+        assert_eq!(config.no_tun, Some(true));
+        assert!(config.peer_urls.is_empty());
+        assert_eq!(config.listener_urls, vec!["tcp://0.0.0.0:11010"]);
+
+        network.members[0].virtual_ipv4 = Some("10.42.0.3".to_owned());
+        let compiled = compile(&network).unwrap();
+        assert_eq!(
+            compiled.members[0].network_config.virtual_ipv4.as_deref(),
+            Some("10.42.0.3")
+        );
+        // Ordinary members continue to use the network's shared identity and peers.
+        network.members[0].runtime_instance_id = None;
+        let compiled = compile(&network).unwrap();
+        assert_eq!(
+            compiled.members[0].network_config.instance_id,
+            Some(network.id.to_string())
+        );
+        assert_eq!(
+            compiled.members[0].network_config.peer_urls,
+            vec!["tcp://gateway.example.com:11010"]
+        );
     }
 
     #[test]

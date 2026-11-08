@@ -90,6 +90,8 @@ pub enum NetworkMode {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NetworkMemberIntent {
     pub id: Uuid,
+    #[serde(default)]
+    pub runtime_instance_id: Option<Uuid>,
     pub device_id: String,
     pub hostname: Option<String>,
     pub virtual_ipv4: Option<String>,
@@ -102,6 +104,12 @@ pub struct NetworkMemberIntent {
     /// members authenticate their groups through their credential grant and
     /// must leave this empty.
     pub acl_group_secret: Option<String>,
+}
+
+impl NetworkMemberIntent {
+    pub fn instance_id(&self, network_id: Uuid) -> Uuid {
+        self.runtime_instance_id.unwrap_or(network_id)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

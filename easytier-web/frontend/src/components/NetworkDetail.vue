@@ -237,7 +237,7 @@ const loadCandidateCidrs = async (member: CentralNetworkMember) => {
         return;
     }
     try {
-        const addrs = await api?.get_node_interface_ips(member.device_id, networkId.value);
+        const addrs = await api?.get_node_interface_ips(member.device_id, member.instance_id ?? networkId.value);
         const virtualPrefix = (member.runtime_virtual_ipv4 ?? member.virtual_ipv4 ?? member.allocated_ipv4 ?? '')
             .split('/')[0].split('.').slice(0, 3).join('.');
         const cidrs = new Set<string>();
@@ -488,7 +488,7 @@ const exportNodeConfig = async () => {
     nodeTomlConfig.value = undefined;
     nodeConfigVisible.value = true;
     try {
-        nodeTomlConfig.value = await api?.get_node_toml_config(nodeDetailMember.value.device_id, networkId.value);
+        nodeTomlConfig.value = await api?.get_node_toml_config(nodeDetailMember.value.device_id, nodeDetailMember.value.instance_id ?? networkId.value);
     } catch (e: any) {
         nodeTomlConfig.value = '';
         toast.add({ severity: 'error', summary: t('web.network_detail.export_config'), detail: e?.response?.data?.message ?? String(e), life: 5000 });
@@ -532,7 +532,7 @@ const ipv4ToString = (addr?: { address?: { addr?: number } } | null) => {
 const loadNodeDetail = async () => {
     if (!nodeDetailMember.value) return;
     const machine_id = nodeDetailMember.value.device_id;
-    const inst_id = networkId.value;
+    const inst_id = nodeDetailMember.value.instance_id ?? networkId.value;
     nodeDetailError.value = undefined;
     const results = await Promise.allSettled([
         api?.get_node_routes(machine_id, inst_id),

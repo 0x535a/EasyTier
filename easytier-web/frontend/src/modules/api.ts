@@ -89,6 +89,7 @@ export interface CentralNetworkDetail extends CentralNetworkSummary {
 
 export interface CentralNetworkMember {
     member_id: string;
+    instance_id?: string;
     device_id: string;
     hostname: string | null;
     hostname_override: string | null;

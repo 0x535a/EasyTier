@@ -35,6 +35,7 @@ pub(crate) struct CentralOwnedRuntimeConfig {
 
 struct PreparedMember {
     id: String,
+    runtime_instance_id: Option<String>,
     device_id: Uuid,
     hostname: Option<String>,
     virtual_ipv4: Option<String>,
@@ -95,6 +96,7 @@ fn prepare_intent(intent: CentralNetworkIntent) -> Result<PreparedIntent, Centra
         })?;
         members.push(PreparedMember {
             id: member.id.to_string(),
+            runtime_instance_id: member.runtime_instance_id.map(|id| id.to_string()),
             device_id,
             hostname: member.hostname.clone(),
             virtual_ipv4: member.virtual_ipv4.clone(),
@@ -186,7 +188,7 @@ impl Db {
             .await
             .map_err(sqlx_db_error)?;
         let owned: HashSet<String> = sqlx::query_scalar(
-            "SELECT network_id FROM network_members WHERE user_id = ? AND device_id = ?",
+            "SELECT COALESCE(runtime_instance_id, network_id) FROM network_members WHERE user_id = ? AND device_id = ?",
         )
         .bind(user_id)
         .bind(device_id.to_string())
@@ -273,7 +275,7 @@ impl Db {
     ) -> Result<Vec<CentralOwnedRuntimeConfig>, sea_orm::DbErr> {
         let rows = sqlx::query_as::<_, (String, String)>(
             r#"
-            SELECT networks.id, networks.network_name
+            SELECT COALESCE(network_members.runtime_instance_id, networks.id), networks.network_name
             FROM networks JOIN network_members
                 ON networks.user_id = network_members.user_id
                 AND networks.id = network_members.network_id
@@ -390,17 +392,17 @@ async fn remove_obsolete_member_configs(
         .iter()
         .map(|member| member.device_id.to_string())
         .collect();
-    let previous: Vec<String> = sqlx::query_scalar(
-        "SELECT device_id FROM network_members WHERE user_id = ? AND network_id = ?",
+    let previous: Vec<(String, String)> = sqlx::query_as(
+        "SELECT device_id, COALESCE(runtime_instance_id, network_id) FROM network_members WHERE user_id = ? AND network_id = ?",
     )
     .bind(user_id)
     .bind(network_id.to_string())
     .fetch_all(&mut **transaction)
     .await
     .map_err(sqlx_db_error)?;
-    for device_id in previous {
+    for (device_id, instance_id) in previous {
         if !retained.contains(&device_id) {
-            delete_member_config(transaction, user_id, &device_id, &network_id.to_string()).await?;
+            delete_member_config(transaction, user_id, &device_id, &instance_id).await?;
         }
     }
     Ok(())
@@ -499,8 +501,8 @@ async fn persist_intent(
             INSERT INTO network_members (
                 user_id, network_id, id, device_id, hostname_override,
                 virtual_ipv4, allocated_ipv4, override_config, credential_id,
-                acl_group_secret, create_time, update_time
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                acl_group_secret, runtime_instance_id, create_time, update_time
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(prepared.intent.user_id)
@@ -513,6 +515,7 @@ async fn persist_intent(
         .bind(&member.override_config)
         .bind(&member.credential_id)
         .bind(&member.acl_group_secret)
+        .bind(&member.runtime_instance_id)
         .bind(now)
         .bind(now)
         .execute(&mut **transaction)
@@ -655,11 +658,12 @@ async fn load_intent(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
     );
     let member_rows: Vec<MemberRow> = sqlx::query_as(
         r#"
         SELECT allocated_ipv4, id, device_id, hostname_override, virtual_ipv4,
-            override_config, credential_id, acl_group_secret
+            override_config, credential_id, acl_group_secret, runtime_instance_id
         FROM network_members
         WHERE user_id = ? AND network_id = ?
         ORDER BY id
@@ -682,8 +686,18 @@ async fn load_intent(
                 override_config,
                 credential_id,
                 acl_group_secret,
+                runtime_instance_id,
             )| {
                 Ok(NetworkMemberIntent {
+                    runtime_instance_id: runtime_instance_id
+                        .as_deref()
+                        .map(Uuid::parse_str)
+                        .transpose()
+                        .map_err(|error| {
+                            CentralIntentError::InvalidStoredData(format!(
+                                "invalid runtime instance id: {error}"
+                            ))
+                        })?,
                     id: Uuid::parse_str(&id).map_err(|_| {
                         CentralIntentError::InvalidStoredData(format!("invalid member id {id}"))
                     })?,
@@ -740,6 +754,7 @@ mod tests {
 
     fn member(id: u128, device_id: Uuid, credential_id: Option<&str>) -> NetworkMemberIntent {
         NetworkMemberIntent {
+            runtime_instance_id: None,
             id: Uuid::from_u128(id),
             device_id: device_id.to_string(),
             hostname: Some(format!("device-{id}")),
@@ -795,6 +810,69 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn imported_runtime_identity_roundtrips_and_is_used_for_ownership_and_delete() {
+        let db = Db::memory_db().await;
+        let user = db.auto_create_user("imported-member").await.unwrap().id;
+        let devices = [Uuid::new_v4(), Uuid::new_v4()];
+        register_devices(&db, user, &devices).await;
+        let network_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        let mut network = intent(user, network_id, devices);
+        network.members[1].runtime_instance_id = Some(runtime_id);
+        db.save_central_network_intent(network).await.unwrap();
+        let loaded = db
+            .load_central_network_intent(user, network_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let member = loaded
+            .members
+            .iter()
+            .find(|m| m.device_id == devices[0].to_string())
+            .unwrap();
+        assert_eq!(member.runtime_instance_id, Some(runtime_id));
+        assert_eq!(
+            db.central_owned_runtime_configs(user, devices[0])
+                .await
+                .unwrap()[0]
+                .instance_id,
+            runtime_id
+        );
+        let config = compile(&loaded)
+            .unwrap()
+            .members
+            .into_iter()
+            .find(|m| m.device_id == devices[0].to_string())
+            .unwrap();
+        db.publish_central_device_configs(
+            user,
+            devices[0],
+            vec![crate::webhook::ManagedNetworkConfig {
+                instance_id: runtime_id.to_string(),
+                network_config: serde_json::to_value(config.network_config).unwrap(),
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.list_network_configs((user, devices[0]), ListNetworkProps::All)
+                .await
+                .unwrap()[0]
+                .network_instance_id,
+            runtime_id.to_string()
+        );
+        db.delete_central_network_intent(user, network_id)
+            .await
+            .unwrap();
+        assert!(
+            db.list_network_configs((user, devices[0]), ListNetworkProps::All)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

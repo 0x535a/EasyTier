@@ -15,6 +15,8 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub device_id: String,
     #[sea_orm(column_type = "Text", nullable)]
+    pub runtime_instance_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
     pub hostname_override: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub virtual_ipv4: Option<String>,
